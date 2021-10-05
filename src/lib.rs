@@ -19,6 +19,8 @@
 
 /// Functions related to SPL tokens
 pub mod associated_token;
+/// Functions related to the native SOL token
+pub mod native_token;
 /// Structs and data
 pub mod state;
 /// Utility functions
