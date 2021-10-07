@@ -45,16 +45,18 @@ pub struct InitializeAccounts<'a> {
     pub recipient: AccountInfo<'a>,
     /// The associated token account address of `recipient` (could be either empty or initialized)
     pub recipient_tokens: AccountInfo<'a>,
-    /// The account holding the stream metadata — expects empty (non-initialized) account
+    /// The account holding the stream metadata — expects empty (not-initialized) account
     pub metadata: AccountInfo<'a>,
-    /// The escrow account holding the stream funds — expects empty (non-initialized) account
+    /// The escrow account holding the stream funds — expects empty (not-initialized) account
     pub escrow_tokens: AccountInfo<'a>,
     /// The SPL token mint account
     pub mint: AccountInfo<'a>,
     /// The Rent Sysvar account
     pub rent: AccountInfo<'a>,
-    /// The SPL token program
+    /// The SPL program needed in case associated account for the new recipients is being created
     pub token_program: AccountInfo<'a>,
+    /// The Associated Token program needed in case associated account for the new recipients is being created
+    pub associated_token_program: AccountInfo<'a>,
     /// The Solana system program
     pub system_program: AccountInfo<'a>,
 }
@@ -69,6 +71,7 @@ pub struct WithdrawAccounts<'a> {
     /// The escrow account holding the stream funds
     pub escrow_tokens: AccountInfo<'a>,
     /// The SPL token mint account
+    //todo: needed only for logging/debugging purposes, to get the token decimals
     pub mint: AccountInfo<'a>,
     /// The SPL token program
     pub token_program: AccountInfo<'a>,
@@ -89,6 +92,7 @@ pub struct CancelAccounts<'a> {
     /// The escrow account holding the stream funds
     pub escrow_tokens: AccountInfo<'a>,
     /// The SPL token mint account
+    //todo: needed only for logging/debugging purposes, to get the token decimals
     pub mint: AccountInfo<'a>,
     /// The SPL token program
     pub token_program: AccountInfo<'a>,
@@ -100,20 +104,21 @@ pub struct TransferAccounts<'a> {
     pub existing_recipient: AccountInfo<'a>,
     /// New stream beneficiary
     pub new_recipient: AccountInfo<'a>,
-    /// New stream beneficiary's token account
-    /// If not initialized, it will be created and `existing_recipient` is the fee payer
+    /// New stream beneficiary's token account. If not initialized, it will be created and `existing_recipient` is a fee payer
     pub new_recipient_tokens: AccountInfo<'a>,
     /// The account holding the stream metadata
     pub metadata: AccountInfo<'a>,
     /// The escrow account holding the stream funds
     pub escrow_tokens: AccountInfo<'a>,
-    /// The SPL token mint account
+    /// The SPL token mint account needed in case associated account for the new recipients is being created
     pub mint: AccountInfo<'a>,
     /// Rent account
     pub rent: AccountInfo<'a>,
-    /// The SPL token program
+    /// The SPL program needed in case associated account for the new recipients is being created
     pub token_program: AccountInfo<'a>,
-    /// The Solana system program
+    /// The Associated Token program needed in case associated account for the new recipients is being created
+    pub associated_token_program: AccountInfo<'a>,
+    /// The Solana system program needed in case associated account for the new recipients is being created
     pub system_program: AccountInfo<'a>,
 }
 
@@ -199,7 +204,7 @@ impl TokenStreamData {
             0
         };
 
-        // TODO: Use uint arithmetics, floats are imprecise
+        //TODO: use uint arithmetics, floats are imprecise
         let num_periods = (self.ix.end_time - cliff) as f64 / self.ix.period as f64;
         let period_amount = (self.ix.amount - cliff_amount) as f64 / num_periods;
         let periods_passed = (now - cliff) / self.ix.period;
