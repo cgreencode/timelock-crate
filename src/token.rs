@@ -1,6 +1,4 @@
 // Copyright (c) 2021 Ivan Jelincic <parazyd@dyne.org>
-//               2021 imprfekt <imprfekt@icloud.com>
-//               2021 Ivan Britvic <ivbritvic@gmail.com>
 //
 // This file is part of streamflow-finance/timelock-crate
 //
@@ -15,9 +13,8 @@
 //
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
-use borsh::BorshSerialize;
+use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::{
-    borsh as solana_borsh,
     entrypoint::ProgramResult,
     msg,
     program::{invoke, invoke_signed},
@@ -29,12 +26,9 @@ use solana_program::{
 };
 use spl_associated_token_account::{create_associated_token_account, get_associated_token_address};
 
-use crate::error::StreamFlowError::{
-    AccountsNotWritable, InvalidMetadata, MintMismatch, TransferNotAllowed, StreamClosed
-};
 use crate::state::{
-    CancelAccounts, InitializeAccounts, StreamInstruction, TokenStreamData, TopUpAccounts,
-    TransferAccounts, WithdrawAccounts,
+    CancelAccounts, InitializeAccounts, StreamInstruction, TokenStreamData, TransferAccounts,
+    WithdrawAccounts,
 };
 use crate::utils::{
     duration_sanity, encode_base10, pretty_time, unpack_mint_account, unpack_token_account,
@@ -46,9 +40,6 @@ use crate::utils::{
 /// and the stream's metadata. Both accounts will be funded to be
 /// rent-exempt if necessary. When the stream is finished, these
 /// shall be returned to the stream initializer.
-
-const MAX_STRING_SIZE: usize = 200;
-
 pub fn create(
     program_id: &Pubkey,
     acc: InitializeAccounts,
@@ -67,7 +58,8 @@ pub fn create(
         || !acc.metadata.is_writable
         || !acc.escrow_tokens.is_writable
     {
-        return Err(AccountsNotWritable.into());
+        // TODO: Add custom error "Accounts not writable"
+        return Err(ProgramError::Custom(1));
     }
 
     let (escrow_tokens_pubkey, nonce) =
@@ -92,7 +84,7 @@ pub fn create(
 
     if &sender_token_info.mint != acc.mint.key {
         // Mint mismatch
-        return Err(MintMismatch.into());
+        return Err(ProgramError::Custom(3));
     }
 
     let now = Clock::get()?.unix_timestamp as u64;
@@ -101,51 +93,9 @@ pub fn create(
         return Err(ProgramError::InvalidArgument);
     }
 
-    if ix.stream_name.len() > MAX_STRING_SIZE {
-        msg!("Error: Stream name too long!");
-        return Err(ProgramError::InvalidArgument);
-    }
-
-    // TODO: Calculate cancel_data once continuous streams are ready
-    let mut metadata = TokenStreamData::new(
-        now,
-        *acc.sender.key,
-        *acc.sender_tokens.key,
-        *acc.recipient.key,
-        *acc.recipient_tokens.key,
-        *acc.mint.key,
-        *acc.escrow_tokens.key,
-        ix.start_time,
-        ix.end_time,
-        ix.deposited_amount,
-        ix.total_amount,
-        ix.period,
-        ix.cliff,
-        ix.cliff_amount,
-        ix.cancelable_by_sender,
-        ix.cancelable_by_recipient,
-        ix.withdrawal_public,
-        ix.transferable_by_sender,
-        ix.transferable_by_recipient,
-        ix.release_rate,
-        ix.stream_name,
-    );
-
-    // Move closable_at (from third party), when reccuring ignore end_date
-    if ix.deposited_amount < ix.total_amount || ix.release_rate > 0 {
-        metadata.closable_at = metadata.closable();
-        msg!("Closable at: {}", metadata.closable_at);
-    }
-
     // We also transfer enough to be rent-exempt on the metadata account.
-    let metadata_bytes = metadata.try_to_vec()?;
-    // We pad % 8 for size , since that's what has to be allocated.
-    let mut metadata_struct_size = metadata_bytes.len();
-    while metadata_struct_size % 8 > 0 {
-        metadata_struct_size += 1;
-    }
+    let metadata_struct_size = std::mem::size_of::<TokenStreamData>();
     let tokens_struct_size = spl_token::state::Account::LEN;
-
     let cluster_rent = Rent::get()?;
     let metadata_rent = cluster_rent.minimum_balance(metadata_struct_size);
     let mut tokens_rent = cluster_rent.minimum_balance(tokens_struct_size);
@@ -162,10 +112,34 @@ pub fn create(
         return Err(ProgramError::InsufficientFunds);
     }
 
-    if sender_token_info.amount < ix.deposited_amount {
+    if sender_token_info.amount < ix.total_amount {
         msg!("Error: Insufficient tokens in sender's wallet");
         return Err(ProgramError::InsufficientFunds);
     }
+
+    // TODO: Calculate cancel_data once continuous streams are ready
+    let metadata = TokenStreamData::new(
+        now,
+        *acc.sender.key,
+        *acc.sender_tokens.key,
+        *acc.recipient.key,
+        *acc.recipient_tokens.key,
+        *acc.mint.key,
+        *acc.escrow_tokens.key,
+        ix.start_time,
+        ix.end_time,
+        ix.total_amount,
+        ix.total_amount,
+        ix.period,
+        ix.cliff,
+        ix.cliff_amount,
+        ix.cancelable_by_sender,
+        ix.cancelable_by_recipient,
+        ix.withdrawal_public,
+        ix.transferable,
+        ix.stream_name,
+    );
+    let bytes = metadata.try_to_vec()?;
 
     if acc.recipient_tokens.data_is_empty() {
         msg!("Initializing recipient's associated token account");
@@ -201,7 +175,7 @@ pub fn create(
 
     // Write the metadata to the account
     let mut data = acc.metadata.try_borrow_mut_data()?;
-    data[0..metadata_bytes.len()].clone_from_slice(&metadata_bytes);
+    data[0..bytes.len()].clone_from_slice(&bytes);
 
     let seeds = [acc.metadata.key.as_ref(), &[nonce]];
     msg!("Creating account for holding tokens");
@@ -246,7 +220,7 @@ pub fn create(
             acc.escrow_tokens.key,
             acc.sender.key,
             &[],
-            metadata.ix.deposited_amount,
+            metadata.ix.total_amount,
         )?,
         &[
             acc.sender_tokens.clone(),
@@ -258,7 +232,7 @@ pub fn create(
 
     msg!(
         "Successfully initialized {} {} token stream for {}",
-        encode_base10(metadata.ix.deposited_amount, mint_info.decimals.into()),
+        encode_base10(metadata.ix.total_amount, mint_info.decimals.into()),
         metadata.mint,
         acc.recipient.key
     );
@@ -320,10 +294,10 @@ pub fn withdraw(program_id: &Pubkey, acc: WithdrawAccounts, amount: u64) -> Prog
     }
 
     let mut data = acc.metadata.try_borrow_mut_data()?;
-    // This thing is nasty lol
-    let mut metadata: TokenStreamData = match solana_borsh::try_from_slice_unchecked(&data) {
+    let mut metadata = match TokenStreamData::try_from_slice(&data) {
         Ok(v) => v,
-        Err(_) => return Err(InvalidMetadata.into()),
+        // TODO: Add "Invalid Metadata" as error
+        Err(_) => return Err(ProgramError::Custom(2)),
     };
 
     let mint_info = unpack_mint_account(&acc.mint)?;
@@ -378,8 +352,7 @@ pub fn withdraw(program_id: &Pubkey, acc: WithdrawAccounts, amount: u64) -> Prog
     data[0..bytes.len()].clone_from_slice(&bytes);
 
     // Return rent when everything is withdrawn
-    if metadata.withdrawn_amount == metadata.ix.deposited_amount {
-        // Do we need this?
+    if metadata.withdrawn_amount == metadata.ix.total_amount {
         if !acc.sender.is_writable || acc.sender.key != &metadata.sender {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -420,7 +393,7 @@ pub fn withdraw(program_id: &Pubkey, acc: WithdrawAccounts, amount: u64) -> Prog
     msg!(
         "Remaining: {} {} tokens",
         encode_base10(
-            metadata.ix.deposited_amount - metadata.withdrawn_amount,
+            metadata.ix.total_amount - metadata.withdrawn_amount,
             mint_info.decimals.into()
         ),
         metadata.mint
@@ -462,30 +435,24 @@ pub fn cancel(program_id: &Pubkey, acc: CancelAccounts) -> ProgramResult {
     if acc.token_program.key != &spl_token::id()
         || acc.escrow_tokens.key != &escrow_tokens_pubkey
         || acc.recipient_tokens.key != &recipient_tokens_key
+        //TODO: Update in future releases based on `cancelable_by_sender/recipient`
+        || acc.cancel_authority.key != acc.sender.key
     {
         return Err(ProgramError::InvalidAccountData);
     }
 
-    let mut data = acc.metadata.try_borrow_mut_data()?;
-    // let mut metadata = match TokenStreamData::try_from_slice(&data) {
-    let mut metadata: TokenStreamData = match solana_borsh::try_from_slice_unchecked(&data) {
-        Ok(v) => v,
-        Err(_) => return Err(InvalidMetadata.into()),
-    };
-    let mint_info = unpack_mint_account(&acc.mint)?;
-
-    let now = Clock::get()?.unix_timestamp as u64;
-    // if stream expired anyone can close it, if not check cancel authority
-    msg!("Now: {}, closable at {}", now, metadata.closable_at);
-    if now < metadata.closable_at {
-        //TODO: Update in future releases based on `cancelable_by_sender/recipient`
-        if acc.cancel_authority.key != acc.sender.key {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        if !acc.cancel_authority.is_signer {
-            return Err(ProgramError::MissingRequiredSignature);
-        }
+    if !acc.cancel_authority.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
     }
+
+    let mut data = acc.metadata.try_borrow_mut_data()?;
+    let mut metadata = match TokenStreamData::try_from_slice(&data) {
+        Ok(v) => v,
+        // TODO: Invalid Metadata error
+        Err(_) => return Err(ProgramError::Custom(3)),
+    };
+
+    let mint_info = unpack_mint_account(&acc.mint)?;
 
     if acc.sender.key != &metadata.sender
         || acc.sender_tokens.key != &metadata.sender_tokens
@@ -497,10 +464,9 @@ pub fn cancel(program_id: &Pubkey, acc: CancelAccounts) -> ProgramResult {
         return Err(ProgramError::InvalidAccountData);
     }
 
+    let now = Clock::get()?.unix_timestamp as u64;
     let available = metadata.available(now);
-    msg!("Available {}", available);
-    let escrow_token_info = unpack_token_account(&acc.escrow_tokens)?;
-    msg!("Amount {}", escrow_token_info.amount);
+
     let seeds = [acc.metadata.key.as_ref(), &[nonce]];
     invoke_signed(
         &spl_token::instruction::transfer(
@@ -519,16 +485,10 @@ pub fn cancel(program_id: &Pubkey, acc: CancelAccounts) -> ProgramResult {
         ],
         &[&seeds],
     )?;
-    let escrow_token_info = unpack_token_account(&acc.escrow_tokens)?;
-    msg!("Amount {}", escrow_token_info.amount);
+
     metadata.withdrawn_amount += available;
-    let remains = metadata.ix.deposited_amount - metadata.withdrawn_amount;
-    msg!(
-        "Deposited {} , withdrawn: {}, tokens remain {}",
-        metadata.ix.deposited_amount,
-        metadata.withdrawn_amount,
-        remains
-    );
+    let remains = metadata.ix.total_amount - metadata.withdrawn_amount;
+
     // Return any remaining funds to the stream initializer
     if remains > 0 {
         invoke_signed(
@@ -553,6 +513,7 @@ pub fn cancel(program_id: &Pubkey, acc: CancelAccounts) -> ProgramResult {
     // TODO: Check this for wrapped SOL
     let rent_escrow_tokens = acc.escrow_tokens.lamports();
     // let remains_meta = acc.metadata.lamports();
+
     //Close escrow token account
     invoke_signed(
         &spl_token::instruction::close_account(
@@ -571,10 +532,9 @@ pub fn cancel(program_id: &Pubkey, acc: CancelAccounts) -> ProgramResult {
     )?;
 
     //TODO: Close metadata account once there is alternative storage solution for historic data.
-    if now < metadata.closable_at {
-        metadata.last_withdrawn_at = now;
-        metadata.canceled_at = now;
-    }
+
+    metadata.last_withdrawn_at = now;
+    metadata.canceled_at = now;
     // Write the metadata to the account
     let bytes = metadata.try_to_vec().unwrap();
     data[0..bytes.len()].clone_from_slice(&bytes);
@@ -599,7 +559,6 @@ pub fn cancel(program_id: &Pubkey, acc: CancelAccounts) -> ProgramResult {
 
 pub fn transfer_recipient(program_id: &Pubkey, acc: TransferAccounts) -> ProgramResult {
     msg!("Transferring stream recipient");
-
     if acc.metadata.data_is_empty()
         || acc.metadata.owner != program_id
         || acc.escrow_tokens.data_is_empty()
@@ -608,39 +567,23 @@ pub fn transfer_recipient(program_id: &Pubkey, acc: TransferAccounts) -> Program
         return Err(ProgramError::UninitializedAccount);
     }
 
-    if !acc.authorized_wallet.is_signer {
+    if !acc.existing_recipient.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
 
     if !acc.metadata.is_writable
-        || !acc.authorized_wallet.is_writable
+        || !acc.existing_recipient.is_writable
         || !acc.new_recipient_tokens.is_writable
     {
         return Err(ProgramError::InvalidAccountData);
     }
 
     let mut data = acc.metadata.try_borrow_mut_data()?;
-    let mut metadata: TokenStreamData = match solana_borsh::try_from_slice_unchecked(&data) {
+    let mut metadata = match TokenStreamData::try_from_slice(&data) {
         Ok(v) => v,
-        Err(_) => return Err(InvalidMetadata.into()),
+        // TODO: Add "Invalid Metadata" as an error
+        Err(_) => return Err(ProgramError::Custom(3)),
     };
-
-    if !metadata.ix.transferable_by_recipient && !metadata.ix.transferable_by_sender {
-        return Err(TransferNotAllowed.into());
-    }
-
-    // See if the caller is authorized
-    let mut authorized = false;
-    if metadata.ix.transferable_by_recipient && &metadata.recipient == acc.authorized_wallet.key {
-        authorized = true;
-    }
-    if metadata.ix.transferable_by_sender && &metadata.sender == acc.authorized_wallet.key {
-        authorized = true;
-    }
-    if !authorized {
-        msg!("Error: Unauthorized wallet");
-        return Err(TransferNotAllowed.into());
-    }
 
     let (escrow_tokens_pubkey, _) =
         Pubkey::find_program_address(&[acc.metadata.key.as_ref()], program_id);
@@ -649,7 +592,7 @@ pub fn transfer_recipient(program_id: &Pubkey, acc: TransferAccounts) -> Program
 
     if acc.new_recipient_tokens.key != &new_recipient_tokens_key
         || acc.mint.key != &metadata.mint
-        || acc.authorized_wallet.key != &metadata.recipient
+        || acc.existing_recipient.key != &metadata.recipient
         || acc.escrow_tokens.key != &metadata.escrow_tokens
         || acc.escrow_tokens.key != &escrow_tokens_pubkey
         || acc.token_program.key != &spl_token::id()
@@ -668,20 +611,23 @@ pub fn transfer_recipient(program_id: &Pubkey, acc: TransferAccounts) -> Program
         let lps = fees.fee_calculator.lamports_per_signature;
 
         // TODO: Check if wrapped SOL
-        if acc.authorized_wallet.lamports() < tokens_rent + lps {
-            msg!("Error: Insufficient funds in {}", acc.authorized_wallet.key);
+        if acc.existing_recipient.lamports() < tokens_rent + lps {
+            msg!(
+                "Error: Insufficient funds in {}",
+                acc.existing_recipient.key
+            );
             return Err(ProgramError::InsufficientFunds);
         }
 
         msg!("Initializing new recipient's associated token account");
         invoke(
             &create_associated_token_account(
-                acc.authorized_wallet.key,
+                acc.existing_recipient.key,
                 acc.new_recipient.key,
                 acc.mint.key,
             ),
             &[
-                acc.authorized_wallet.clone(),    // Funding
+                acc.existing_recipient.clone(),   // Funding
                 acc.new_recipient_tokens.clone(), // Associated token account's address
                 acc.new_recipient.clone(),        // Wallet address
                 acc.mint.clone(),
@@ -698,99 +644,6 @@ pub fn transfer_recipient(program_id: &Pubkey, acc: TransferAccounts) -> Program
 
     let bytes = metadata.try_to_vec()?;
     data[0..bytes.len()].clone_from_slice(&bytes);
-
-    Ok(())
-}
-
-/// Top up the SPL Token stream
-///
-/// The function will add the amount to the metadata SPL account
-pub fn topup_stream(program_id: &Pubkey, acc: TopUpAccounts, amount: u64) -> ProgramResult {
-    msg!("Topping up the escrow account");
-
-    if acc.metadata.data_is_empty() || acc.escrow_tokens.owner != &spl_token::id() {
-        return Err(ProgramError::UninitializedAccount);
-    }
-
-    if !acc.sender.is_writable
-        || !acc.sender_tokens.is_writable
-        || !acc.metadata.is_writable
-        || !acc.escrow_tokens.is_writable
-    {
-        return Err(AccountsNotWritable.into());
-    }
-
-    let (escrow_tokens_pubkey, _) =
-        Pubkey::find_program_address(&[acc.metadata.key.as_ref()], program_id);
-
-    if acc.token_program.key != &spl_token::id() || acc.escrow_tokens.key != &escrow_tokens_pubkey {
-        return Err(ProgramError::InvalidAccountData);
-    }
-
-    if !acc.sender.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-
-    let sender_token_info = unpack_token_account(&acc.sender_tokens)?;
-
-    if &sender_token_info.mint != acc.mint.key {
-        return Err(MintMismatch.into());
-    }
-
-    if amount == 0 {
-        msg!("Error: Amount can't be zero.");
-        return Err(ProgramError::InvalidArgument);
-    }
-
-    let mut data = acc.metadata.try_borrow_mut_data()?;
-    let mut metadata: TokenStreamData = match solana_borsh::try_from_slice_unchecked(&data) {
-        Ok(v) => v,
-        Err(_) => return Err(InvalidMetadata.into()),
-    };
-
-    if acc.mint.key != &metadata.mint || acc.escrow_tokens.key != &metadata.escrow_tokens {
-        msg!("Error: Metadata does not match given accounts");
-        return Err(ProgramError::InvalidAccountData);
-    }
-
-    let now = Clock::get()?.unix_timestamp as u64;
-    if metadata.closable() < now {
-        msg!("Error: Topup after the stream is closed");
-        return Err(StreamClosed.into());
-    }
-
-    msg!("Transferring to the escrow account");
-    invoke(
-        &spl_token::instruction::transfer(
-            acc.token_program.key,
-            acc.sender_tokens.key,
-            acc.escrow_tokens.key,
-            acc.sender.key,
-            &[],
-            amount,
-        )?,
-        &[
-            acc.sender_tokens.clone(),
-            acc.escrow_tokens.clone(),
-            acc.sender.clone(),
-            acc.token_program.clone(),
-        ],
-    )?;
-
-    metadata.ix.deposited_amount += amount;
-    metadata.closable_at = metadata.closable();
-
-    let bytes = metadata.try_to_vec().unwrap();
-    data[0..bytes.len()].clone_from_slice(&bytes);
-
-    let mint_info = unpack_mint_account(&acc.mint)?;
-
-    msg!(
-        "Successfully topped up {} to token stream {} on behalf of {}",
-        encode_base10(amount, mint_info.decimals.into()),
-        acc.escrow_tokens.key,
-        acc.sender.key,
-    );
 
     Ok(())
 }
